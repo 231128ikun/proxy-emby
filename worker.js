@@ -33,6 +33,12 @@ const ADMIN_SHOW_LOGS = 300;
 
 const TZ = "Asia/Shanghai";
 
+// 日志/最近使用等数据保留：7 天（北京时间）
+const DATA_TTL_DAYS = 7;
+const DATA_TTL_MS = DATA_TTL_DAYS * 86400_000;
+let LAST_CLEANUP_MS = 0;
+const CLEANUP_INTERVAL_MS = 30 * 60_000;
+
 // ip->city cache
 const IP_GEO_TTL_SEC = 7 * 86400;
 
@@ -53,6 +59,12 @@ export default {
       return text("错误：未绑定 D1（变量名必须是 DB）", 500);
     }
     await ensureDb(env);
+
+    // 定期清理（不阻塞请求）
+    if (Date.now() - LAST_CLEANUP_MS > CLEANUP_INTERVAL_MS) {
+      LAST_CLEANUP_MS = Date.now();
+      ctx.waitUntil(cleanupOldData(env));
+    }
 
     // 先取一次客户端信息（避免 waitUntil 里取不到/取不稳定）
     const meta = getClientMeta(request);
@@ -478,7 +490,7 @@ function adminHtml({ pageOrigin, baseDomains, manualDomains, users, wl, whitelis
     .join("");
 
   const lastSeenTable = (lastSeen || [])
-    .map((r) => `<tr>
+    .map((r) => `<tr data-user="${escapeHtml(r.user)}" data-ts="${escapeHtml(r.last_ts || "")}" data-count="${escapeHtml(String(r.count ?? 0))}">
       <td>${escapeHtml(r.user)}</td>
       <td>${escapeHtml(r.note || "")}</td>
       <td>${escapeHtml(r.origin)}</td>
@@ -594,7 +606,7 @@ summary{cursor:pointer}
       <select id="baseSel">${baseOptions}</select>
       <select id="userSel">${userOpts}</select>
       <select id="originSel">
-        <option value="" selected>（先选择白名单）</option>
+        ${wlLocked ? `<option value="" selected>（白名单未启用）</option>` : `<option value="" selected>（先选择白名单）</option>`}
         ${wlOpts}
       </select>
     </div>
@@ -635,21 +647,39 @@ summary{cursor:pointer}
     </div>
   </details>
 
-  <div class="box">
-    <h3 style="margin:0 0 6px">最近使用
-      <span class="tip" data-tip="按 user + origin 统计次数与最后访问时间。">?</span>
-    </h3>
-    <table style="margin-top:8px">
-      <thead><tr><th>user</th><th>备注</th><th>origin</th><th>次数</th><th>最后时间(北京时间)</th></tr></thead>
-      <tbody>${lastSeenTable}</tbody>
-    </table>
-  </div>
+  <details class="box" open>
+    <summary><b>最近使用</b></summary>
+    <div class="row" style="margin-top:8px">
+      <label>user：
+        <select id="lsUserFilter">
+          <option value="" selected>全部</option>
+          ${(users || []).map((u)=>`<option value="${escapeHtml(u.user)}">${escapeHtml(u.user)}</option>`).join("")}
+        </select>
+      </label>
+      <label>排序：
+        <select id="lsSort">
+          <option value="ts_desc" selected>按时间(新→旧)</option>
+          <option value="count_desc">按次数(高→低)</option>
+        </select>
+      </label>
+    </div>
+    <div class="logwrap">
+      <table id="lsTable" style="margin-top:8px">
+        <thead><tr><th>user</th><th>备注</th><th>origin</th><th>次数</th><th>最后时间(北京时间)</th></tr></thead>
+        <tbody>${lastSeenTable}</tbody>
+      </table>
+    </div>
+  </details>
 
   <details class="box" open>
     <summary><b>最近日志</b></summary>
     <small>仅保留最新 ${LOG_MAX} 条；时间为北京时间。</small>
+    <div class="row" style="margin-top:8px">
+      <input id="logQ" class="out" placeholder="关键词筛选（支持时间/IP/user/origin/UA 等）"/>
+      <small id="logQStat"></small>
+    </div>
     <div class="logwrap">
-      <table>
+      <table id="logTable">
         <thead>
           <tr>
             <th>时间</th><th>IP</th><th>City</th><th>COLO</th>
@@ -670,12 +700,22 @@ summary{cursor:pointer}
   const originSel = document.getElementById('originSel');
   const out = document.getElementById('linkOut');
   const btn = document.getElementById('copyBtn');
+  const WL_ENABLED = ${whitelistEnabled ? "true" : "false"};
 
   function build(){
     const base = (baseSel.value || '').replace(/\\/+$/,'');
     const user = userSel.value || '';
     const origin = originSel.value || '';
-    if(!base || !user || !origin){ out.value=''; return; }
+    if(!base || !user){ out.value=''; return; }
+
+    // 白名单关闭：链接=base/user
+    if(!WL_ENABLED){
+      out.value = base + '/' + encodeURIComponent(user);
+      return;
+    }
+
+    // 白名单开启：需要选择 origin
+    if(!origin){ out.value=''; return; }
     try{
       const u = new URL(origin);
       const proto = u.protocol.replace(':','');
@@ -688,6 +728,8 @@ summary{cursor:pointer}
   originSel.addEventListener('change', build);
   build();
 
+  if(!WL_ENABLED){ originSel.disabled = true; }
+
   btn.addEventListener('click', async () => {
     if(!out.value) return;
     try{
@@ -699,6 +741,53 @@ summary{cursor:pointer}
       document.execCommand('copy');
     }
   });
+})();
+
+(function(){
+  // 最近使用：筛选 + 排序（前端）
+  const tb = document.querySelector('#lsTable tbody');
+  const userSel = document.getElementById('lsUserFilter');
+  const sortSel = document.getElementById('lsSort');
+  if(tb && userSel && sortSel){
+    const allRows = Array.from(tb.querySelectorAll('tr'));
+    function render(){
+      const u = (userSel.value || '');
+      const mode = sortSel.value || 'ts_desc';
+      const rows = allRows
+        .filter(r => !u || (r.dataset.user === u))
+        .sort((a,b)=>{
+          if(mode === 'count_desc'){
+            return (Number(b.dataset.count||0) - Number(a.dataset.count||0)) || String(b.dataset.ts||'').localeCompare(String(a.dataset.ts||''));
+          }
+          return String(b.dataset.ts||'').localeCompare(String(a.dataset.ts||'')); // ts_desc
+        });
+      tb.innerHTML = '';
+      for(const r of rows) tb.appendChild(r);
+    }
+    userSel.addEventListener('change', render);
+    sortSel.addEventListener('change', render);
+    render();
+  }
+
+  // 日志：关键词筛选（前端）
+  const logQ = document.getElementById('logQ');
+  const logQStat = document.getElementById('logQStat');
+  const logTb = document.querySelector('#logTable tbody');
+  if(logQ && logTb){
+    const rows = Array.from(logTb.querySelectorAll('tr'));
+    function apply(){
+      const q = (logQ.value || '').trim().toLowerCase();
+      let shown = 0;
+      for(const r of rows){
+        const ok = !q || (r.innerText || '').toLowerCase().includes(q);
+        r.style.display = ok ? '' : 'none';
+        if(ok) shown++;
+      }
+      if(logQStat) logQStat.textContent = q ? ('显示 ' + shown + '/' + rows.length) : '';
+    }
+    logQ.addEventListener('input', apply);
+    apply();
+  }
 })();
 </script>
 </body>
@@ -905,6 +994,9 @@ async function ensureDb(env) {
       INSERT OR IGNORE INTO proxy_users(user, enabled, note, created_at, updated_at)
       VALUES('ikun', 1, '', ?, ?)
     `).bind(now, now).run();
+
+    // 启动后做一次清理（非必要，但更符合“7 天后重置”）
+    await cleanupOldData(env);
   })();
 
   return DB_INIT;
@@ -1154,6 +1246,21 @@ function nowLocal() {
   const date = d.toLocaleDateString("en-CA", { timeZone: TZ });
   const time = d.toLocaleTimeString("en-GB", { timeZone: TZ, hour12: false });
   return `${date} ${time}`;
+}
+
+function tsFromMs(ms) {
+  const d = new Date(ms);
+  const date = d.toLocaleDateString("en-CA", { timeZone: TZ });
+  const time = d.toLocaleTimeString("en-GB", { timeZone: TZ, hour12: false });
+  return `${date} ${time}`;
+}
+
+async function cleanupOldData(env) {
+  const cutoffTs = tsFromMs(Date.now() - DATA_TTL_MS);
+  const cutoffGeo = Math.floor(Date.now() / 1000) - DATA_TTL_DAYS * 86400;
+  try { await env.DB.prepare(`DELETE FROM proxy_logs WHERE ts < ?`).bind(cutoffTs).run(); } catch {}
+  try { await env.DB.prepare(`DELETE FROM proxy_last_seen WHERE last_ts < ?`).bind(cutoffTs).run(); } catch {}
+  try { await env.DB.prepare(`DELETE FROM proxy_ipgeo WHERE updated_at < ?`).bind(cutoffGeo).run(); } catch {}
 }
 
 function shorten(s, n) {
