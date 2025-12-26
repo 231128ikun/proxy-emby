@@ -1,186 +1,137 @@
-# Emby Proxy Gateway
+# Cloudflare Workers 反向代理
 
-一个基于 Cloudflare Workers + D1 的安全反向代理服务，专为 Emby 等媒体服务器设计，支持多用户、白名单控制、访问日志统计和 WebSocket 连接。
+这是一个基于 Cloudflare Workers + D1 数据库的反向代理服务，支持多用户、白名单管理、访问统计和日志记录功能。
 
-## ✨ 特性
+## 功能特性
 
-- 🔐 **多用户隔离**：支持多个独立用户入口，每个用户有独立的访问路径
-- 🛡️ **白名单保护**：只允许访问预设的上游服务器，支持自定义端口
-- 📊 **访问统计**：自动记录每日访问量、成功/拒绝次数，支持 30 天历史查看
-- 📝 **详细日志**：记录每次请求的完整信息（时间、IP、UA、状态码等）
-- 🌐 **WebSocket 支持**：完整支持 WebSocket 协议，适配 Emby 实时功能
-- 🎨 **可视化界面**：美观的 Web 管理界面，一键生成代理链接
+- **多用户管理**：支持创建多个代理入口（user），每个入口可独立启用/禁用
+- **白名单机制**：仅允许访问白名单内的目标地址（按 origin 匹配）
+- **访问统计**：记录每个用户+目标地址的访问次数和最后访问时间
+- **日志系统**：保留最近访问日志（含 IP、城市、操作类型等），便于审计
+- **直链支持**：可配置特定域名后缀，当上游返回 302 重定向时直接返回给客户端
+- **WebSocket 支持**：自动处理 WebSocket 连接代理
+- **管理界面**：提供 Web 管理面板，可视化管理所有配置
 
-## 🚀 快速开始
+## 部署步骤
 
-### 1. 部署到 Cloudflare Workers
+### 1. 准备工作
 
-1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)
-2. 进入 **Workers & Pages**
-3. 点击 **Create Application** → **Create Worker**
-4. 复制代码并部署
+- 注册 [Cloudflare](https://www.cloudflare.com/) 账户
+- 进入 Cloudflare Dashboard
 
 ### 2. 创建 D1 数据库
 
-1. 在 Cloudflare Dashboard 中进入 **Storage & Databases** → **D1**
-2. 点击 **Create database**
-3. 输入数据库名称（如 `proxy-db`）
-4. 创建完成后，记下数据库 ID
+1. 进入 **Workers & Pages** → **D1 SQL Database**
+2. 点击 **Create database**，数据库名称任意（例如：`proxy_db`）
+3. 创建完成后记下数据库名称
 
-### 3. 绑定 D1 数据库
+### 3. 部署 Workers
 
-1. 在 Worker 设置中找到 **Settings** → **Variables**
-2. 添加 **D1 Database Bindings**：
-   - Variable name: `DB`
-   - D1 database: 选择刚创建的数据库
+1. 进入 **Workers & Pages** → **Create application** → **Create Worker**
+2. 创建 Worker，名称任意（例如：`proxy-worker`）
+3. 点击 **Quick Edit**，将 `worker.js` 的完整代码粘贴进去
+4. 点击 **Save and Deploy**
 
-### 4. 配置环境变量
+### 4. 绑定 D1 数据库
 
-在 Worker 的 **Settings** → **Variables** 中添加：
+1. 进入刚创建的 Worker 设置页面
+2. 找到 **Settings** → **Variables and Secrets**
+3. 在 **D1 Database Bindings** 部分点击 **Add binding**
+4. **Variable name** 必须填写 `DB`（大写）
+5. **D1 database** 选择刚才创建的数据库
+6. 点击 **Save**
 
-| 变量名 | 类型 | 必填 | 说明 | 示例 |
-|--------|------|------|------|------|
-| `USERS` | 文本 | 否 | 允许的用户列表，多个用逗号或换行分隔 | `ikun,user123,alice` |
-| `WHITELIST` | 文本 | 是 | 上游服务器白名单，每行一个，支持端口 | `https://emby.example.com:8096` |
+### 5. 设置管理员密码
 
-**环境变量示例：**
+1. 在 **Settings** → **Variables and Secrets** 页面
+2. 在 **Environment Variables** 部分点击 **Add variable**
+3. **Variable name** 填写 `ADMIN_PASSWORD`
+4. **Value** 填写你的管理员密码（自定义，请妥善保管）
+5. 勾选 **Encrypt**
+6. 点击 **Save**
 
-```bash
-# USERS（默认为 ikun）
-ikun
-alice
-bob123
+### 6. 完成部署
 
-# WHITELIST（必填，支持多行）
-https://emby.example.com:8096
-https://media.example.com
-https://jellyfin.example.com:8920
-```
+部署完成后，访问你的 Worker 地址（例如：`https://proxy-worker.your-account.workers.dev`）即可看到概览页面。
 
-### 5. 访问管理界面
+## 使用方法
 
-部署完成后，访问 `https://your-worker.workers.dev/{user}` 查看管理界面。
+### 管理后台
 
-## 📖 使用教程
+1. 访问 `https://your-worker-url/admin`
+2. 使用你设置的 `ADMIN_PASSWORD` 登录
+3. 在管理界面可以：
+   - 添加/管理用户（入口）
+   - 添加/删除白名单
+   - 生成代理链接
+   - 查看访问统计和日志
+   - 配置直链域名后缀
 
-### 生成代理链接
+### 代理请求格式
 
-1. 访问 `https://your-worker.workers.dev/ikun`（将 `ikun` 替换为你的用户名）
-2. 在界面中选择：
-   - **user**：选择要使用的用户
-   - **whitelist origin**：选择目标服务器
-3. 点击 **生成** 按钮
-4. 复制生成的代理链接
-
-**生成的链接格式：**
-```
-https://your-worker.workers.dev/{user}/https:/emby.example.com:8096
-```
-
-### 在 Emby 客户端中使用
-
-将生成的代理链接作为服务器地址填入 Emby 客户端：
-
-- **Android/iOS 客户端**：在添加服务器时填入代理链接
-- **Web 客户端**：直接访问代理链接
-- **桌面客户端**：在服务器设置中填入代理链接
-
-### 路径格式支持
-
-代理支持多种 URL 格式：
-
-```bash
-# 标准格式（推荐）
-/{user}/https:/example.com:8096/path
-
-# 双斜杠格式
-/{user}/https://example.com:8096/path
-
-# 省略协议（默认 https）
-/{user}/example.com:8096/path
-```
-
-## 📊 功能说明
-
-### 访问统计
-
-- **近 30 天统计**：以柱状图展示每天的总请求数、成功数、拒绝数
-- **近 7 天汇总**：快速查看最近一周的访问概况
-
-### 日志记录
-
-每条日志包含：
-- **时间戳**：精确到秒的 ISO 时间
-- **结果状态**：allow/deny/error + HTTP 状态码
-- **上游服务器**：目标服务器的 origin
-- **客户端信息**：IP 地址、User-Agent、Cloudflare 边缘节点
-- **请求详情**：HTTP 方法、请求路径
-
-### 安全控制
-
-1. **用户验证**：只有配置的用户才能访问
-2. **白名单检查**：只能访问白名单中的上游服务器
-3. **自动记录**：所有拒绝请求都会被记录，包含拒绝原因
-
-## 🔧 高级配置
-
-### 多端口支持
-
-白名单支持自定义端口：
+代理请求的 URL 格式为：
 
 ```
-https://emby1.example.com:8096
-https://emby2.example.com:8920
-http://local.server:8080
+https://your-worker-url/{user}/{protocol}:/{host[:port]}{path}
 ```
 
-### WebSocket 连接
+**示例：**
 
-代理自动识别并转发 WebSocket 连接，无需额外配置。Emby 的实时功能（如播放同步、在线状态）可正常使用。
+- 代理 `https://example.com/api/data`：
+  ```
+  https://your-worker-url/ikun/https:/example.com/api/data
+  ```
 
-### 客户端 IP 传递
+- 代理 `http://192.168.1.100:8096/web/index.html`：
+  ```
+  https://your-worker-url/ikun/http:/192.168.1.100:8096/web/index.html
+  ```
 
-代理自动添加以下请求头，方便上游服务器获取真实 IP：
-- `X-Forwarded-For`
-- `X-Real-IP`
+**说明：**
+- `{user}`：在管理后台创建的用户名（默认有 `ikun`）
+- `{protocol}`：目标地址的协议（`http` 或 `https`）
+- `{host[:port]}`：目标地址的域名或 IP（可选端口号）
+- `{path}`：目标地址的路径部分（可选）
 
-## 🛠️ 故障排查
+### 使用流程
 
-### 1. 访问根路径显示 "fail"
+1. **添加白名单**：在管理后台添加需要代理的目标地址（按 origin 匹配）
+   - 支持格式：`example.com`、`https://example.com`、`example.com:8096` 等
+   - 支持批量添加（逗号或换行分隔）
 
-**原因**：未绑定 D1 数据库或未配置环境变量
+2. **生成链接**：使用管理后台的"入口链接生成"功能自动拼装代理 URL
 
-**解决**：
-- 确认已创建并绑定 D1 数据库（变量名必须为 `DB`）
-- 确认已配置 `WHITELIST` 环境变量
+3. **发起请求**：使用生成的代理 URL 访问目标服务
 
-### 2. 403 Forbidden (invalid user)
+## 注意事项
 
-**原因**：访问的用户名不在 `USERS` 列表中
+- **数据库绑定**：D1 数据库的变量名必须是 `DB`（大写），否则无法正常工作
+- **管理员密码**：请务必设置强密码，并妥善保管
+- **白名单机制**：只有在白名单中的目标地址才能被代理访问
+- **日志保留**：系统仅保留最近 2000 条日志，旧日志会自动删除
+- **资源限制**：受 Cloudflare Workers 免费套餐限制，请勿滥用
 
-**解决**：在环境变量中添加该用户名，或使用默认用户 `ikun`
+## 免责声明
 
-### 3. 403 Forbidden (upstream not allowed)
+- **责任限制**：作者不对脚本可能导致的任何安全问题、数据损失、服务中断、法律纠纷或其他损害负责。使用此脚本需自行承担风险。
 
-**原因**：目标服务器不在白名单中
+- **不当使用**：使用者需了解，本脚本可能被用于非法活动或未经授权的访问。作者强烈反对和谴责任何不当使用脚本的行为，并鼓励合法合规的使用。
 
-**解决**：在 `WHITELIST` 环境变量中添加目标服务器的完整 origin（包含端口）
+- **合法性**：请确保遵守所有适用的法律、法规和政策，包括但不限于互联网使用政策、隐私法规和知识产权法。确保您拥有对目标地址的合法访问权限。
 
-### 4. 502 Bad Gateway
+- **自担风险**：使用此脚本需自行承担风险。作者和 Cloudflare 不对脚本的滥用、不当使用或导致的任何损害承担责任。
 
-**原因**：无法连接到上游服务器
+**请确保在使用本脚本时遵守您所在地区的法律法规，使用者需自行承担相应的风险与责任。**
 
-**解决**：
-- 检查上游服务器是否正常运行
-- 确认防火墙是否允许 Cloudflare IP 访问
-- 检查白名单中的地址是否正确（包含协议和端口）
+## 资源链接
 
-## 📝 注意事项
+- [Cloudflare Workers 文档](https://developers.cloudflare.com/workers/)
+- [Cloudflare D1 文档](https://developers.cloudflare.com/d1/)
 
-1. **数据库变量名**：D1 数据库绑定的变量名必须是 `DB`（大写）
-2. **端口号**：白名单中的地址需要包含完整的端口号，如 `:8096`
-3. **HTTPS**：建议使用 HTTPS 协议，如省略协议则默认使用 HTTPS
-4. **首次运行**：首次访问时会自动创建数据表，可能需要等待几秒
-5. **日志限制**：单个用户最多显示 120 条最近日志
+## 许可证
 
-**提示**：部署完成后，建议先访问根路径 `/` 确认服务正常运行，再访问 `/{user}` 查看管理界面。
+本项目采用 MIT 许可证。详细信息请参阅 [LICENSE](LICENSE) 文件。
+
+---
+
+如有问题或建议，欢迎提出 Issue 或贡献代码。
