@@ -33,9 +33,12 @@ const ADMIN_SHOW_LOGS = 300;
 
 const TZ = "Asia/Shanghai";
 
-// 日志/最近使用等数据保留：7 天（北京时间）
-const DATA_TTL_DAYS = 7;
-const DATA_TTL_MS = DATA_TTL_DAYS * 86400_000;
+// 每天北京时间 08:00 重置“最近使用/总次数”
+const RESET_HOUR = 8;
+
+// 日志最多保留：7 天（北京时间）
+const LOG_TTL_DAYS = 7;
+const LOG_TTL_MS = LOG_TTL_DAYS * 86400_000;
 let LAST_CLEANUP_MS = 0;
 const CLEANUP_INTERVAL_MS = 30 * 60_000;
 
@@ -60,10 +63,13 @@ export default {
     }
     await ensureDb(env);
 
-    // 定期清理（不阻塞请求）
+    // 每天 08:00（北京时间）重置统计（不重置白名单/用户/配置/日志）
+    await ensureDailyReset(env);
+
+    // 定期清理日志（不阻塞请求）
     if (Date.now() - LAST_CLEANUP_MS > CLEANUP_INTERVAL_MS) {
       LAST_CLEANUP_MS = Date.now();
-      ctx.waitUntil(cleanupOldData(env));
+      ctx.waitUntil(cleanupOldLogs(env));
     }
 
     // 先取一次客户端信息（避免 waitUntil 里取不到/取不稳定）
@@ -406,7 +412,7 @@ async function handleAdmin(request, env) {
   }
 
   const pageOrigin = new URL(request.url).origin;
-  const [baseDomains, manualDomains, users, wl, whitelistEnabled, lastSeen, logs] = await Promise.all([
+  const [baseDomains, manualDomains, users, wl, whitelistEnabled, lastSeen, logs, summary] = await Promise.all([
     getBaseDomains(env),
     getManualRedirectDomains(env),
     listUsers(env),
@@ -414,9 +420,10 @@ async function handleAdmin(request, env) {
     getWhitelistEnabled(env),
     listLastSeen(env, 300),
     listLogs(env, ADMIN_SHOW_LOGS),
+    getSummary(env),
   ]);
 
-  return html(adminHtml({ pageOrigin, baseDomains, manualDomains, users, wl, whitelistEnabled, lastSeen, logs }));
+  return html(adminHtml({ pageOrigin, baseDomains, manualDomains, users, wl, whitelistEnabled, lastSeen, logs, summary }));
 }
 
 function loginHtml(msg) {
@@ -442,12 +449,15 @@ small{color:#c00}
 </div>`;
 }
 
-function adminHtml({ pageOrigin, baseDomains, manualDomains, users, wl, whitelistEnabled, lastSeen, logs }) {
+function adminHtml({ pageOrigin, baseDomains, manualDomains, users, wl, whitelistEnabled, lastSeen, logs, summary }) {
   const origin = pageOrigin;
   const bases = dedupe([origin, ...(baseDomains || [])]).map((b) => b.replace(/\/+$/, ""));
   const baseText = (baseDomains || []).join("\n");
   const manualText = (manualDomains || []).join("\n");
   const wlLocked = !whitelistEnabled;
+
+  const sum = summary || {};
+  const usageLine = `总次数: ${sum.total_requests ?? 0} / 最后: ${sum.last_activity || ""}`;
 
   const userOpts = (users || [])
     .map((u) => `<option value="${escapeHtml(u.user)}"${u.user === "ikun" ? " selected" : ""}>${escapeHtml(u.user)}${u.enabled ? "" : " (禁用)"}</option>`)
@@ -606,12 +616,12 @@ summary{cursor:pointer}
       <select id="baseSel">${baseOptions}</select>
       <select id="userSel">${userOpts}</select>
       <select id="originSel">
-        ${wlLocked ? `<option value="" selected>（白名单未启用）</option>` : `<option value="" selected>（先选择白名单）</option>`}
+        <option value="" selected>${wlLocked ? "（白名单未启用）" : "（先选择白名单）"}</option>
         ${wlOpts}
       </select>
     </div>
     <div class="row" style="margin-top:8px">
-      <input id="linkOut" class="out" readonly placeholder="选择白名单后生成链接"/>
+      <input id="linkOut" class="out" readonly placeholder="${wlLocked ? "生成链接：base/user" : "选择白名单后生成链接"}"/>
       <button id="copyBtn" type="button">复制</button>
     </div>
     <small>格式：/{user}/{proto}:/{host[:port]}，后面可继续带 Emby 路径。</small>
@@ -648,7 +658,7 @@ summary{cursor:pointer}
   </details>
 
   <details class="box" open>
-    <summary><b>最近使用</b></summary>
+    <summary><b>最近使用</b> <small>${escapeHtml(usageLine)}</small></summary>
     <div class="row" style="margin-top:8px">
       <label>user：
         <select id="lsUserFilter">
@@ -673,7 +683,7 @@ summary{cursor:pointer}
 
   <details class="box" open>
     <summary><b>最近日志</b></summary>
-    <small>仅保留最新 ${LOG_MAX} 条；时间为北京时间。</small>
+    <small>仅保留最新 ${LOG_MAX} 条；时间为北京时间；最多保留 ${LOG_TTL_DAYS} 天。</small>
     <div class="row" style="margin-top:8px">
       <input id="logQ" class="out" placeholder="关键词筛选（支持时间/IP/user/origin/UA 等）"/>
       <small id="logQStat"></small>
@@ -708,7 +718,7 @@ summary{cursor:pointer}
     const origin = originSel.value || '';
     if(!base || !user){ out.value=''; return; }
 
-    // 白名单关闭：链接=base/user
+    // 白名单关闭：base/user
     if(!WL_ENABLED){
       out.value = base + '/' + encodeURIComponent(user);
       return;
@@ -994,9 +1004,6 @@ async function ensureDb(env) {
       INSERT OR IGNORE INTO proxy_users(user, enabled, note, created_at, updated_at)
       VALUES('ikun', 1, '', ?, ?)
     `).bind(now, now).run();
-
-    // 启动后做一次清理（非必要，但更符合“7 天后重置”）
-    await cleanupOldData(env);
   })();
 
   return DB_INIT;
@@ -1037,6 +1044,7 @@ async function setManualRedirectDomains(env, list) {
     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
   `).bind(JSON.stringify(list || []), nowLocal()).run();
 }
+
 async function getWhitelistEnabled(env) {
   const row = await env.DB.prepare(`SELECT value FROM proxy_config WHERE key='whitelistEnabled'`).first();
   return row && row.value === "1";
@@ -1048,7 +1056,6 @@ async function setWhitelistEnabled(env, enabled) {
     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
   `).bind(enabled ? "1" : "0", nowLocal()).run();
 }
-
 
 async function upsertUser(env, user, note) {
   const now = nowLocal();
@@ -1176,6 +1183,64 @@ async function getSummary(env) {
   };
 }
 
+/* ================= Daily reset (08:00) ================= */
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function localDateStr(d) {
+  return d.toLocaleDateString("en-CA", { timeZone: TZ });
+}
+
+function localHour(d) {
+  const hh = d.toLocaleTimeString("en-GB", { timeZone: TZ, hour12: false, hour: "2-digit" });
+  return Number(hh);
+}
+
+function currentResetKey() {
+  const now = new Date();
+  const h = localHour(now);
+  let date = localDateStr(now);
+  if (h < RESET_HOUR) {
+    const y = new Date(now.getTime() - 86400_000);
+    date = localDateStr(y);
+  }
+  return `${date} ${pad2(RESET_HOUR)}:00:00`;
+}
+
+// 只重置 proxy_last_seen，从而“最近使用/根域名总次数”同步归零
+async function ensureDailyReset(env) {
+  const key = "dailyResetStart";
+  const cur = currentResetKey();
+  try {
+    const row = await env.DB.prepare(`SELECT value FROM proxy_config WHERE key=?`).bind(key).first();
+    if (!row || row.value !== cur) {
+      await env.DB.prepare(`DELETE FROM proxy_last_seen`).run();
+      await env.DB.prepare(`
+        INSERT INTO proxy_config(key,value,updated_at) VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+      `).bind(key, cur, nowLocal()).run();
+    }
+  } catch {}
+}
+
+/* ================= Logs cleanup (7 days) ================= */
+
+function tsFromMs(ms) {
+  const d = new Date(ms);
+  const date = d.toLocaleDateString("en-CA", { timeZone: TZ });
+  const time = d.toLocaleTimeString("en-GB", { timeZone: TZ, hour12: false });
+  return `${date} ${time}`;
+}
+
+async function cleanupOldLogs(env) {
+  const cutoffTs = tsFromMs(Date.now() - LOG_TTL_MS);
+  const cutoffGeo = Math.floor(Date.now() / 1000) - LOG_TTL_DAYS * 86400;
+  try { await env.DB.prepare(`DELETE FROM proxy_logs WHERE ts < ?`).bind(cutoffTs).run(); } catch {}
+  try { await env.DB.prepare(`DELETE FROM proxy_ipgeo WHERE updated_at < ?`).bind(cutoffGeo).run(); } catch {}
+}
+
 /* ================= URL / normalize ================= */
 
 function parseUpstreamUrl(restPath, search) {
@@ -1248,21 +1313,6 @@ function nowLocal() {
   return `${date} ${time}`;
 }
 
-function tsFromMs(ms) {
-  const d = new Date(ms);
-  const date = d.toLocaleDateString("en-CA", { timeZone: TZ });
-  const time = d.toLocaleTimeString("en-GB", { timeZone: TZ, hour12: false });
-  return `${date} ${time}`;
-}
-
-async function cleanupOldData(env) {
-  const cutoffTs = tsFromMs(Date.now() - DATA_TTL_MS);
-  const cutoffGeo = Math.floor(Date.now() / 1000) - DATA_TTL_DAYS * 86400;
-  try { await env.DB.prepare(`DELETE FROM proxy_logs WHERE ts < ?`).bind(cutoffTs).run(); } catch {}
-  try { await env.DB.prepare(`DELETE FROM proxy_last_seen WHERE last_ts < ?`).bind(cutoffTs).run(); } catch {}
-  try { await env.DB.prepare(`DELETE FROM proxy_ipgeo WHERE updated_at < ?`).bind(cutoffGeo).run(); } catch {}
-}
-
 function shorten(s, n) {
   if (!s) return "";
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -1303,3 +1353,4 @@ function html(s, status = 200) {
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
 }
+
