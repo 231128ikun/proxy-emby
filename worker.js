@@ -58,18 +58,9 @@ export default {
     const meta = getClientMeta(request);
 
     if (url.pathname === "/") {
-      const summary = await getSummary(env);
-      const city = await getCity(env, meta.ip, meta.city);
+      const summary = await getSummary(env), city = await getCity(env, meta.ip, meta.city);
 
-      return html(
-        rootHtml({
-          summary,
-          ip: meta.ip,
-          city,
-          colo: meta.colo,
-        }),
-        200
-      );
+      return html(rootHtml({ summary, ip: meta.ip, city, colo: meta.colo }), 200);
     }
 
     if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
@@ -116,7 +107,7 @@ export default {
     }
 
     const originKey = canonicalOrigin(upstreamUrl);
-    if (!(await isWhitelisted(env, originKey))) {
+    if ((await getWhitelistEnabled(env)) && !(await isWhitelisted(env, originKey))) {
       ctx.waitUntil(
         writeLog(env, meta, {
           user,
@@ -202,7 +193,7 @@ export default {
         }
 
         const redirOriginKey = canonicalOrigin(redirectUrl);
-        if (!(await isWhitelisted(env, redirOriginKey))) {
+        if ((await getWhitelistEnabled(env)) && !(await isWhitelisted(env, redirOriginKey))) {
           ctx.waitUntil(
             writeLog(env, meta, {
               user,
@@ -272,11 +263,12 @@ export default {
 
 /* ================= Root page (NO logs) ================= */
 
-function rootHtml({ error, summary, ip, city, colo }) {
-  if (error) {
-    return `<!doctype html><meta charset="utf-8"/><h3>${escapeHtml(error)}</h3><p><a href="/admin">进入管理</a></p>`;
-  }
+function rootHtml(p) {
+  p = p || {};
+  const error = p.error;
+  if (error) return `<!doctype html><meta charset="utf-8"/><h3>${escapeHtml(error)}</h3><p><a href="/admin">进入管理</a></p>`;
 
+  const summary = p.summary || {}, ip = p.ip, city = p.city, colo = p.colo;
   const seg = [];
   seg.push(`IP: ${ip || ""}`);
   if (city) seg.push(`City: ${city}`);
@@ -337,6 +329,11 @@ async function handleAdmin(request, env) {
     }
 
     try {
+      if (action === "set_wl_enabled") {
+        const v = String(form.get("wl_enabled") || "");
+        await setWhitelistEnabled(env, v === "1" ? 1 : 0);
+      }
+
       if (action === "set_base_domains") {
         const raw = String(form.get("base_domains") || "");
         const list = splitList(raw).map(safeBase).filter(Boolean);
@@ -372,14 +369,18 @@ async function handleAdmin(request, env) {
       }
 
       if (action === "add_wl") {
-        const raw = String(form.get("origin") || "");
-        const items = splitList(raw).map(normalizeOrigin).filter(Boolean);
-        for (const o of items) await addWhitelist(env, o);
+        if (await getWhitelistEnabled(env)) {
+          const raw = String(form.get("origin") || "");
+          const items = splitList(raw).map(normalizeOrigin).filter(Boolean);
+          for (const o of items) await addWhitelist(env, o);
+        }
       }
 
       if (action === "del_wl") {
-        const origin = normalizeOrigin(String(form.get("origin") || "")) || "";
-        if (origin) await deleteWhitelist(env, origin);
+        if (await getWhitelistEnabled(env)) {
+          const origin = normalizeOrigin(String(form.get("origin") || "")) || "";
+          if (origin) await deleteWhitelist(env, origin);
+        }
       }
     } catch (e) {
       return html(`<pre>操作失败：${escapeHtml(String(e))}</pre><p><a href="/admin">返回</a></p>`, 500);
@@ -393,16 +394,17 @@ async function handleAdmin(request, env) {
   }
 
   const pageOrigin = new URL(request.url).origin;
-  const [baseDomains, manualDomains, users, wl, lastSeen, logs] = await Promise.all([
+  const [baseDomains, manualDomains, users, wl, whitelistEnabled, lastSeen, logs] = await Promise.all([
     getBaseDomains(env),
     getManualRedirectDomains(env),
     listUsers(env),
     listWhitelist(env),
+    getWhitelistEnabled(env),
     listLastSeen(env, 300),
     listLogs(env, ADMIN_SHOW_LOGS),
   ]);
 
-  return html(adminHtml({ pageOrigin, baseDomains, manualDomains, users, wl, lastSeen, logs }));
+  return html(adminHtml({ pageOrigin, baseDomains, manualDomains, users, wl, whitelistEnabled, lastSeen, logs }));
 }
 
 function loginHtml(msg) {
@@ -428,11 +430,12 @@ small{color:#c00}
 </div>`;
 }
 
-function adminHtml({ pageOrigin, baseDomains, manualDomains, users, wl, lastSeen, logs }) {
+function adminHtml({ pageOrigin, baseDomains, manualDomains, users, wl, whitelistEnabled, lastSeen, logs }) {
   const origin = pageOrigin;
   const bases = dedupe([origin, ...(baseDomains || [])]).map((b) => b.replace(/\/+$/, ""));
   const baseText = (baseDomains || []).join("\n");
   const manualText = (manualDomains || []).join("\n");
+  const wlLocked = !whitelistEnabled;
 
   const userOpts = (users || [])
     .map((u) => `<option value="${escapeHtml(u.user)}"${u.user === "ikun" ? " selected" : ""}>${escapeHtml(u.user)}${u.enabled ? "" : " (禁用)"}</option>`)
@@ -468,7 +471,7 @@ function adminHtml({ pageOrigin, baseDomains, manualDomains, users, wl, lastSeen
         <form method="post" style="display:inline" onsubmit="return confirm('确定删除白名单：${escapeHtml(o)} ?')">
           <input type="hidden" name="action" value="del_wl"/>
           <input type="hidden" name="origin" value="${escapeHtml(o)}"/>
-          <button>删除</button>
+          ${wlLocked ? "<button disabled>删除</button>" : "<button>删除</button>"}
         </form>
       </td>
     </tr>`)
@@ -567,10 +570,15 @@ summary{cursor:pointer}
     <h3 style="margin:0 0 6px">白名单
       <span class="tip" data-tip="按 origin（协议+host+可选端口）匹配。支持 example.com、https://example.com:443、example.com:8096。默认端口(80/443)会自动折叠。">?</span>
     </h3>
+    <form method="post" class="row" style="margin-top:6px">
+      <input type="hidden" name="action" value="set_wl_enabled"/>
+      <label><input type="checkbox" name="wl_enabled" value="1"${whitelistEnabled ? " checked" : ""}/> 启用白名单</label>
+      <button>保存</button>
+    </form>
     <form method="post" class="row">
       <input type="hidden" name="action" value="add_wl"/>
-      <input name="origin" class="out" placeholder="支持逗号/换行批量" required/>
-      <button>添加</button>
+      <input name="origin" class="out" placeholder="支持逗号/换行批量" required${wlLocked ? " disabled" : ""}/>
+      <button${wlLocked ? " disabled" : ""}>添加</button>
     </form>
     <table style="margin-top:8px">
       <thead><tr><th>origin</th><th>操作</th></tr></thead>
@@ -890,6 +898,9 @@ async function ensureDb(env) {
     const manualRow = await env.DB.prepare(`SELECT 1 FROM proxy_config WHERE key='manualRedirectDomains'`).first();
     if (!manualRow) await setManualRedirectDomains(env, DEFAULT_MANUAL_REDIRECT_DOMAINS);
 
+    const wlRow = await env.DB.prepare(`SELECT 1 FROM proxy_config WHERE key='whitelistEnabled'`).first();
+    if (!wlRow) await setWhitelistEnabled(env, 0);
+
     await env.DB.prepare(`
       INSERT OR IGNORE INTO proxy_users(user, enabled, note, created_at, updated_at)
       VALUES('ikun', 1, '', ?, ?)
@@ -934,6 +945,18 @@ async function setManualRedirectDomains(env, list) {
     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
   `).bind(JSON.stringify(list || []), nowLocal()).run();
 }
+async function getWhitelistEnabled(env) {
+  const row = await env.DB.prepare(`SELECT value FROM proxy_config WHERE key='whitelistEnabled'`).first();
+  return row && row.value === "1";
+}
+
+async function setWhitelistEnabled(env, enabled) {
+  await env.DB.prepare(`
+    INSERT INTO proxy_config(key,value,updated_at) VALUES('whitelistEnabled',?,?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+  `).bind(enabled ? "1" : "0", nowLocal()).run();
+}
+
 
 async function upsertUser(env, user, note) {
   const now = nowLocal();
